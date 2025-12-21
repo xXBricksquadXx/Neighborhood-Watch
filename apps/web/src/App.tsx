@@ -10,20 +10,34 @@ function uuid(): string {
 
 type ConnStatus = "connecting" | "connected" | "disconnected" | "error";
 
+// engine.io internals are not typed in socket.io-client; keep this dev-safe without `any`
+type EngineEvent = "upgrade" | "transport";
+type EngineLike = {
+  transport?: { name?: string };
+  on?: (event: EngineEvent, cb: (arg: unknown) => void) => void;
+  off?: (event: EngineEvent, cb: (arg: unknown) => void) => void;
+};
+
+function readName(v: unknown): string | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const name = (v as Record<string, unknown>).name;
+  return typeof name === "string" ? name : undefined;
+}
+
 export default function App() {
   const [room, setRoom] = useState("family");
   const [from, setFrom] = useState("laptop");
   const [text, setText] = useState("");
   const [messages, setMessages] = useState<ChatEnvelope[]>([]);
 
-  // Start in "connecting" so we don't need setState in the effect body (ESLint rule)
   const [status, setStatus] = useState<ConnStatus>("connecting");
   const [statusDetail, setStatusDetail] = useState("");
+  const [transport, setTransport] = useState<string>("");
 
   const socketRef = useRef<Socket<ServerToClientEvents, ClientToServerEvents> | null>(null);
   const roomRef = useRef(room);
 
-  // Keep latest room for the connect handler
+  // Keep latest room for connect handler + allow room changes while connected
   useEffect(() => {
     roomRef.current = room;
     const s = socketRef.current;
@@ -38,9 +52,23 @@ export default function App() {
 
     socketRef.current = s;
 
+    const engine = (s.io as unknown as { engine?: EngineLike }).engine;
+
+    const setFromEngine = () => {
+      const name = engine?.transport?.name;
+      if (typeof name === "string") setTransport(name);
+    };
+
+    const onEngineEvent = (arg: unknown) => {
+      const name = readName(arg);
+      if (name) setTransport(name);
+      else setFromEngine();
+    };
+
     s.on("connect", () => {
       setStatus("connected");
       setStatusDetail("");
+      setFromEngine();
       s.emit("join", roomRef.current);
     });
 
@@ -54,11 +82,15 @@ export default function App() {
       setStatusDetail(err?.message ?? String(err));
     });
 
-    s.on("chat", (msg) => {
-      setMessages((prev) => [...prev, msg]);
-    });
+    s.on("chat", (msg) => setMessages((prev) => [...prev, msg]));
+
+    // Track upgrades polling -> websocket
+    engine?.on?.("upgrade", onEngineEvent);
+    engine?.on?.("transport", onEngineEvent);
 
     return () => {
+      engine?.off?.("upgrade", onEngineEvent);
+      engine?.off?.("transport", onEngineEvent);
       s.disconnect();
       socketRef.current = null;
     };
@@ -71,15 +103,14 @@ export default function App() {
     const body = text.trim();
     if (!body) return;
 
-    const msg: ChatEnvelope = {
+    s.emit("chat", {
       id: uuid(),
       room,
       from,
       sentAt: Date.now(),
       body
-    };
+    });
 
-    s.emit("chat", msg);
     setText("");
   }
 
@@ -89,17 +120,16 @@ export default function App() {
 
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
         <label>
-          Room{" "}
-          <input value={room} onChange={(e) => setRoom(e.target.value)} />
+          Room <input value={room} onChange={(e) => setRoom(e.target.value)} />
         </label>
 
         <label>
-          From{" "}
-          <input value={from} onChange={(e) => setFrom(e.target.value)} />
+          From <input value={from} onChange={(e) => setFrom(e.target.value)} />
         </label>
 
         <div>
           Status: <b>{status}</b>
+          {transport ? <span style={{ opacity: 0.7 }}> (transport: {transport})</span> : null}
           {statusDetail ? <span style={{ opacity: 0.7 }}> ({statusDetail})</span> : null}
         </div>
       </div>

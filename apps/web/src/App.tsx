@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
-import type { ChatEnvelope, ClientToServerEvents, ServerToClientEvents } from "@ac/protocol";
+import type {
+  ChatAck,
+  ChatEnvelope,
+  ClientToServerEvents,
+  ServerToClientEvents
+} from "@ac/protocol";
 
 const RELAY_URL = import.meta.env.VITE_RELAY_URL ?? "http://127.0.0.1:8787";
 
@@ -9,8 +14,14 @@ function uuid(): string {
 }
 
 type ConnStatus = "connecting" | "connected" | "disconnected" | "error";
+type Delivery = "pending" | "sent" | "failed";
 
-// engine.io internals are not typed in socket.io-client; keep this dev-safe without `any`
+type ChatItem = ChatEnvelope & {
+  delivery?: Delivery;
+  error?: string;
+};
+
+// engine.io internals: dev-only visibility without `any`
 type EngineEvent = "upgrade" | "transport";
 type EngineLike = {
   transport?: { name?: string };
@@ -28,7 +39,7 @@ export default function App() {
   const [room, setRoom] = useState("family");
   const [from, setFrom] = useState("laptop");
   const [text, setText] = useState("");
-  const [messages, setMessages] = useState<ChatEnvelope[]>([]);
+  const [messages, setMessages] = useState<ChatItem[]>([]);
 
   const [status, setStatus] = useState<ConnStatus>("connecting");
   const [statusDetail, setStatusDetail] = useState("");
@@ -36,6 +47,10 @@ export default function App() {
 
   const socketRef = useRef<Socket<ServerToClientEvents, ClientToServerEvents> | null>(null);
   const roomRef = useRef(room);
+
+  // delivery tracking
+  const pendingRef = useRef(new Set<string>());
+  const seenRef = useRef(new Set<string>());
 
   // Keep latest room for connect handler + allow room changes while connected
   useEffect(() => {
@@ -82,9 +97,35 @@ export default function App() {
       setStatusDetail(err?.message ?? String(err));
     });
 
-    s.on("chat", (msg) => setMessages((prev) => [...prev, msg]));
+    s.on("chat_ack", (ack: ChatAck) => {
+      if (!ack?.id) return;
 
-    // Track upgrades polling -> websocket
+      pendingRef.current.delete(ack.id);
+
+      setMessages((prev) =>
+        prev.map((m) => {
+          if (m.id !== ack.id) return m;
+          if (ack.ok) return { ...m, delivery: "sent", error: "" };
+          return { ...m, delivery: "failed", error: ack.reason ?? "rejected" };
+        })
+      );
+    });
+
+    s.on("chat", (msg: ChatEnvelope) => {
+      // Dedupe by id (server may rebroadcast or client may reconnect/retry later)
+      if (seenRef.current.has(msg.id)) return;
+      seenRef.current.add(msg.id);
+
+      setMessages((prev) => {
+        const idx = prev.findIndex((m) => m.id === msg.id);
+        if (idx === -1) return [...prev, { ...msg, delivery: "sent" }];
+
+        const copy = prev.slice();
+        copy[idx] = { ...copy[idx], ...msg, delivery: "sent", error: "" };
+        return copy;
+      });
+    });
+
     engine?.on?.("upgrade", onEngineEvent);
     engine?.on?.("transport", onEngineEvent);
 
@@ -103,20 +144,26 @@ export default function App() {
     const body = text.trim();
     if (!body) return;
 
-    s.emit("chat", {
+    const msg: ChatEnvelope = {
       id: uuid(),
       room,
       from,
       sentAt: Date.now(),
       body
-    });
+    };
 
+    pendingRef.current.add(msg.id);
+
+    // Add locally for immediate UX; ack will flip delivery -> sent/failed
+    setMessages((prev) => [...prev, { ...msg, delivery: "pending" }]);
+
+    s.emit("chat", msg);
     setText("");
   }
 
   return (
     <div style={{ maxWidth: 720, margin: "24px auto", fontFamily: "system-ui" }}>
-      <h1>Neighborhood Watch v0</h1>
+      <h1>N̷e̷i̷g̷h̷b̷o̷r̷h̷o̷o̷d̷ W̷a̷t̷c̷h̷</h1>
 
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
         <label>
@@ -152,6 +199,8 @@ export default function App() {
           <div key={m.id} style={{ padding: "8px 0", borderBottom: "1px solid #ddd" }}>
             <div style={{ fontSize: 12, opacity: 0.7 }}>
               [{m.room}] {m.from} • {new Date(m.sentAt).toLocaleTimeString()}
+              {m.delivery ? ` • ${m.delivery}` : ""}
+              {m.delivery === "failed" && m.error ? ` (${m.error})` : ""}
             </div>
             <div>{m.body}</div>
           </div>

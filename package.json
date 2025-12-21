@@ -1,12 +1,18 @@
 {
   "name": "alt-connectivity",
   "private": true,
-  "workspaces": ["apps/*", "packages/*"],
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "dev": "npm -w apps/relay run dev & npm -w apps/web run dev",
     "dev:relay": "npm -w apps/relay run dev",
     "dev:web": "npm -w apps/web run dev",
     "build": "npm -w packages/protocol run build && npm -w apps/relay run build && npm -w apps/web run build",
     "doctor": "node -p \"process.version\" && npm -v && git rev-parse --short HEAD"
+  },
+  "volta": {
+    "node": "22.12.0"
   }
 }

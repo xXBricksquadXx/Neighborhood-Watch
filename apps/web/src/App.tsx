@@ -116,7 +116,7 @@ export default function App() {
 
   return (
     <div style={{ maxWidth: 720, margin: "24px auto", fontFamily: "system-ui" }}>
-      <h1>Alt Connectivity v0</h1>
+      <h1>Neighborhood Watch v0</h1>
 
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
         <label>

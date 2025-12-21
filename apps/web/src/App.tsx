@@ -19,9 +19,9 @@ type Delivery = "pending" | "sent" | "failed";
 type Direction = "outgoing" | "incoming";
 
 type ChatItem = ChatEnvelope & {
-  delivery?: Delivery; // only meaningful for outgoing
-  error?: string; // only meaningful for outgoing
-  direction?: Direction; // incoming/outgoing for UI labeling
+  delivery?: Delivery;
+  error?: string;
+  direction?: Direction;
 };
 
 const ROOM_PRESETS = [
@@ -32,6 +32,40 @@ const ROOM_PRESETS = [
   { value: "vacant-3", label: "Vacant Room 3" },
   { value: "vacant-4", label: "Vacant Room 4" }
 ] as const;
+
+type RoomId = (typeof ROOM_PRESETS)[number]["value"];
+
+const ROOM_LOOKUP = new Map<string, RoomId>(
+  ROOM_PRESETS.flatMap((r) => [
+    [r.value.toLowerCase(), r.value],
+    [r.label.toLowerCase(), r.value]
+  ])
+);
+
+function normalizeRoom(raw: string | null | undefined): RoomId | null {
+  if (!raw) return null;
+  const key = raw.trim().toLowerCase();
+  return ROOM_LOOKUP.get(key) ?? null;
+}
+
+function roomLabel(id: string): string {
+  const hit = ROOM_PRESETS.find((r) => r.value === id);
+  return hit ? hit.label : id;
+}
+
+function getInitialRoom(): RoomId {
+  const params = new URLSearchParams(window.location.search);
+  return normalizeRoom(params.get("room")) ?? "family";
+}
+
+function getInitialToken(): string {
+  const params = new URLSearchParams(window.location.search);
+  return (
+    params.get("token") ??
+    (import.meta.env.VITE_INVITE_TOKEN as string | undefined) ??
+    ""
+  );
+}
 
 // engine.io internals: dev-only visibility without `any`
 type EngineEvent = "upgrade" | "transport";
@@ -48,14 +82,18 @@ function readName(v: unknown): string | undefined {
 }
 
 export default function App() {
-  const [roomPreset, setRoomPreset] =
-    useState<(typeof ROOM_PRESETS)[number]["value"]>("family");
+  const [roomPreset, setRoomPreset] = useState<RoomId>(() => getInitialRoom());
+  const token = useMemo(() => getInitialToken(), []);
+
   const [from, setFrom] = useState("laptop");
   const [text, setText] = useState("");
   const [messages, setMessages] = useState<ChatItem[]>([]);
 
-  const [status, setStatus] = useState<ConnStatus>("connecting");
-  const [statusDetail, setStatusDetail] = useState("");
+  // initialize status from token (avoids setState synchronously in effect)
+  const [status, setStatus] = useState<ConnStatus>(() => (token ? "connecting" : "error"));
+  const [statusDetail, setStatusDetail] = useState(() =>
+    token ? "" : "missing_invite_token (use ?token=... or VITE_INVITE_TOKEN)"
+  );
   const [transport, setTransport] = useState<string>("");
 
   const room = roomPreset;
@@ -64,8 +102,8 @@ export default function App() {
     useRef<Socket<ServerToClientEvents, ClientToServerEvents> | null>(null);
   const roomRef = useRef(room);
 
-  // join de-dupe (what we last asked the relay to join)
-  const lastJoinedRoomRef = useRef<string>("");
+  // which rooms we have asked the relay to join on *this* connection
+  const joinedRoomsRef = useRef(new Set<string>());
 
   // Delivery tracking
   const pendingIdsRef = useRef(new Set<string>());
@@ -75,34 +113,49 @@ export default function App() {
   const attemptRef = useRef(new Map<string, number>()); // id -> attempts
   const RETRY_MAX = 5;
 
-  // Dedupe receive
+  // Dedupe receive (in case of reconnect/replay)
   const seenRef = useRef(new Set<string>());
 
-  // Track ids created locally (for incoming/outgoing labeling)
+  // Track ids created locally (for received vs sent labeling)
   const localIdsRef = useRef(new Set<string>());
 
   const visibleMessages = useMemo(() => {
-    // only show active room
     return messages.filter((m) => m.room === room);
   }, [messages, room]);
 
-  // keep latest room for connect handler + allow room changes while connected
-  useEffect(() => {
-    roomRef.current = room;
+  const shareUrl = useMemo(() => {
+    if (!token) return "";
+    const u = new URL(window.location.href);
+    u.searchParams.set("room", room); // share canonical value (relay allowlist expects this)
+    u.searchParams.set("token", token);
+    return u.toString();
+  }, [room, token]);
 
+  function ensureJoined(r: string): void {
     const s = socketRef.current;
     if (!s?.connected) return;
+    if (joinedRoomsRef.current.has(r)) return;
+    s.emit("join", r);
+    joinedRoomsRef.current.add(r);
+  }
 
-    if (lastJoinedRoomRef.current !== room) {
-      s.emit("join", room);
-      lastJoinedRoomRef.current = room;
-    }
+  // keep latest room for connect handler + join on room changes
+  useEffect(() => {
+    roomRef.current = room;
+    ensureJoined(room);
+    
   }, [room]);
 
   useEffect(() => {
+    if (!token) {
+      // already reflected in initial state; do not setState synchronously here
+      return;
+    }
+
     const s = io(RELAY_URL, {
       transports: ["websocket", "polling"],
-      withCredentials: true
+      withCredentials: true,
+      auth: { token }
     });
 
     socketRef.current = s;
@@ -120,15 +173,8 @@ export default function App() {
       else setFromEngine();
     };
 
-    const ensureJoined = (r: string) => {
-      if (!s.connected) return;
-      if (lastJoinedRoomRef.current === r) return;
-      s.emit("join", r);
-      lastJoinedRoomRef.current = r;
-    };
-
     const flushPending = () => {
-      // Group pending by room (in case user switched rooms while offline)
+      // group by room so we can ensure membership first
       const byRoom = new Map<string, ChatEnvelope[]>();
       for (const id of pendingIdsRef.current) {
         const env = pendingMapRef.current.get(id);
@@ -152,9 +198,7 @@ export default function App() {
 
             setMessages((prev) =>
               prev.map((m) =>
-                m.id === env.id
-                  ? { ...m, delivery: "failed", error: "retry_limit" }
-                  : m
+                m.id === env.id ? { ...m, delivery: "failed", error: "retry_limit" } : m
               )
             );
             continue;
@@ -164,7 +208,7 @@ export default function App() {
         }
       }
 
-      // Return to active room
+      // also (re)join current room after reconnect
       ensureJoined(roomRef.current);
     };
 
@@ -173,10 +217,10 @@ export default function App() {
       setStatusDetail("");
       setFromEngine();
 
-      // relay restart => our previous room membership is gone
-      lastJoinedRoomRef.current = "";
-      ensureJoined(roomRef.current);
+      // new connection => previous membership is gone
+      joinedRoomsRef.current.clear();
 
+      ensureJoined(roomRef.current);
       flushPending();
     });
 
@@ -187,7 +231,8 @@ export default function App() {
 
     s.on("connect_error", (err) => {
       setStatus("error");
-      setStatusDetail(err?.message ?? String(err));
+      const msg = err?.message ?? String(err);
+      setStatusDetail(msg === "unauthorized" ? "unauthorized (bad/missing token)" : msg);
     });
 
     s.on("chat_ack", (ack: ChatAck) => {
@@ -207,11 +252,9 @@ export default function App() {
     });
 
     s.on("chat", (msg: ChatEnvelope) => {
-      // Dedupe receive
       if (seenRef.current.has(msg.id)) return;
       seenRef.current.add(msg.id);
 
-      // Determine direction ONCE (do not read refs during render)
       const isLocal = localIdsRef.current.has(msg.id);
       const patch: Partial<ChatItem> = isLocal
         ? { direction: "outgoing" }
@@ -236,7 +279,9 @@ export default function App() {
       s.disconnect();
       socketRef.current = null;
     };
-  }, []);
+    // token is stable (memoized)
+   
+  }, [token]);
 
   function send() {
     const s = socketRef.current;
@@ -253,38 +298,29 @@ export default function App() {
       body
     };
 
-    // Mark id as locally created (for received vs sent labeling)
     localIdsRef.current.add(env.id);
 
-    // Track pending
     pendingIdsRef.current.add(env.id);
     pendingMapRef.current.set(env.id, env);
     attemptRef.current.set(env.id, 0);
 
-    // optimistic add (direction set here, so render doesn't read refs)
-    setMessages((prev) => [
-      ...prev,
-      { ...env, delivery: "pending", direction: "outgoing" }
-    ]);
+    setMessages((prev) => [...prev, { ...env, delivery: "pending", direction: "outgoing" }]);
 
-    // Ensure membership for active room
-    if (s.connected && lastJoinedRoomRef.current !== room) {
-      s.emit("join", room);
-      lastJoinedRoomRef.current = room;
-    }
+    // membership enforcement on relay: join before chat
+    ensureJoined(room);
 
     s.emit("chat", env);
     setText("");
   }
 
   return (
-    <div style={{ maxWidth: 720, margin: "24px auto", fontFamily: "system-ui" }}>
+    <div style={{ maxWidth: 780, margin: "24px auto", fontFamily: "system-ui" }}>
       <h1>N̷e̷i̷g̷h̷b̷o̷r̷h̷o̷o̷d̷ W̷a̷t̷c̷h̷</h1>
 
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
         <label>
           Room{" "}
-          <select value={roomPreset} onChange={(e) => setRoomPreset(e.target.value as any)}>
+          <select value={roomPreset} onChange={(e) => setRoomPreset(e.target.value as RoomId)}>
             {ROOM_PRESETS.map((r) => (
               <option key={r.value} value={r.value}>
                 {r.label}
@@ -303,6 +339,13 @@ export default function App() {
           {statusDetail ? <span style={{ opacity: 0.7 }}> ({statusDetail})</span> : null}
         </div>
       </div>
+
+      {token ? (
+        <div style={{ marginTop: 10, opacity: 0.85, fontSize: 12 }}>
+          Invite link (share):{" "}
+          <input style={{ width: "100%", marginTop: 6 }} readOnly value={shareUrl} />
+        </div>
+      ) : null}
 
       <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
         <input
@@ -323,13 +366,14 @@ export default function App() {
             m.direction === "incoming"
               ? "received"
               : m.delivery
-                ? m.delivery
-                : "sent";
+              ? m.delivery
+              : "sent";
 
           return (
             <div key={m.id} style={{ padding: "8px 0", borderBottom: "1px solid #ddd" }}>
               <div style={{ fontSize: 12, opacity: 0.7 }}>
-                [{m.room}] {m.from} • {new Date(m.sentAt).toLocaleTimeString()} • {label}
+                [{roomLabel(m.room)}] {m.from} • {new Date(m.sentAt).toLocaleTimeString()} •{" "}
+                {label}
                 {label === "failed" && m.error ? ` (${m.error})` : ""}
               </div>
               <div>{m.body}</div>

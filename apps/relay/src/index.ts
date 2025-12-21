@@ -4,7 +4,6 @@ import cors from "cors";
 import { Server } from "socket.io";
 import { z } from "zod";
 import type {
-  ChatAck,
   ChatEnvelope,
   ClientToServerEvents,
   ServerToClientEvents
@@ -75,9 +74,15 @@ io.on("connection", (socket) => {
     console.log(`[relay] disconnect id=${socket.id} reason=${reason}`);
   });
 
+  // IMPORTANT: join == "switch active room"
   socket.on("join", (room) => {
+    // leave all rooms except the implicit socket.id room
+    for (const r of socket.rooms) {
+      if (r !== socket.id) socket.leave(r);
+    }
+
     socket.join(room);
-    console.log(`[relay] join id=${socket.id} room=${room}`);
+    console.log(`[relay] join id=${socket.id} room=${room} (switched)`);
   });
 
   socket.on("chat", (raw: ChatEnvelope) => {
@@ -95,7 +100,9 @@ io.on("connection", (socket) => {
 
     // Membership enforcement: must be in the room you're sending to
     if (!socket.rooms.has(msg.room)) {
-      console.log(`[relay] deny id=${socket.id} msgId=${msg.id} room=${msg.room} reason=not_in_room`);
+      console.log(
+        `[relay] deny id=${socket.id} msgId=${msg.id} room=${msg.room} reason=not_in_room`
+      );
       socket.emit("chat_ack", { id: msg.id, ok: false, reason: "not_in_room" });
       return;
     }

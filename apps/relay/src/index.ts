@@ -44,8 +44,6 @@ function seenHas(id: string): boolean {
 
 function seenAdd(id: string): void {
   seen.set(id, Date.now());
-
-  // Keep memory bounded by deleting oldest insertions
   while (seen.size > SEEN_MAX) {
     const oldest = seen.keys().next().value as string | undefined;
     if (!oldest) break;
@@ -57,10 +55,6 @@ function extractId(raw: unknown): string {
   if (!raw || typeof raw !== "object") return "";
   const id = (raw as Record<string, unknown>).id;
   return typeof id === "string" ? id : "";
-}
-
-function ack(socket: Parameters<Parameters<typeof io.on>[1]>[0], payload: ChatAck) {
-  socket.emit("chat_ack", payload);
 }
 
 const app = express();
@@ -93,17 +87,23 @@ io.on("connection", (socket) => {
       const msgId = extractId(raw);
       const reason = parsed.error.issues[0]?.message ?? "invalid_message";
       console.log(`[relay] reject id=${socket.id} msgId=${msgId} reason=${reason}`);
-
-      ack(socket, { id: msgId, ok: false, reason });
+      socket.emit("chat_ack", { id: msgId, ok: false, reason });
       return;
     }
 
     const msg = parsed.data;
 
+    // Membership enforcement: must be in the room you're sending to
+    if (!socket.rooms.has(msg.room)) {
+      console.log(`[relay] deny id=${socket.id} msgId=${msg.id} room=${msg.room} reason=not_in_room`);
+      socket.emit("chat_ack", { id: msg.id, ok: false, reason: "not_in_room" });
+      return;
+    }
+
     // Dedupe: ack OK but do not rebroadcast
     if (seenHas(msg.id)) {
       console.log(`[relay] dedupe msgId=${msg.id} room=${msg.room} from=${msg.from}`);
-      ack(socket, { id: msg.id, ok: true });
+      socket.emit("chat_ack", { id: msg.id, ok: true });
       return;
     }
 
@@ -114,7 +114,7 @@ io.on("connection", (socket) => {
     );
 
     io.to(msg.room).emit("chat", msg);
-    ack(socket, { id: msg.id, ok: true });
+    socket.emit("chat_ack", { id: msg.id, ok: true });
   });
 });
 

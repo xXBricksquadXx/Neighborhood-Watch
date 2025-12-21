@@ -48,9 +48,14 @@ export default function App() {
   const socketRef = useRef<Socket<ServerToClientEvents, ClientToServerEvents> | null>(null);
   const roomRef = useRef(room);
 
-  // delivery tracking
-  const pendingRef = useRef(new Set<string>());
+  // Delivery tracking
+  const pendingIdsRef = useRef(new Set<string>());
+  const pendingMapRef = useRef(new Map<string, ChatEnvelope>()); // id -> envelope
   const seenRef = useRef(new Set<string>());
+
+  // retry bookkeeping
+  const attemptRef = useRef(new Map<string, number>()); // id -> attempts
+  const RETRY_MAX = 5;
 
   // Keep latest room for connect handler + allow room changes while connected
   useEffect(() => {
@@ -80,11 +85,43 @@ export default function App() {
       else setFromEngine();
     };
 
+    const flushPending = () => {
+      // Ensure we are joined to the current room before resending
+      s.emit("join", roomRef.current);
+
+      for (const id of pendingIdsRef.current) {
+        const env = pendingMapRef.current.get(id);
+        if (!env) continue;
+
+        const attempts = (attemptRef.current.get(id) ?? 0) + 1;
+        attemptRef.current.set(id, attempts);
+
+        if (attempts > RETRY_MAX) {
+          // Mark as failed locally
+          pendingIdsRef.current.delete(id);
+          pendingMapRef.current.delete(id);
+
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === id ? { ...m, delivery: "failed", error: "retry_limit" } : m
+            )
+          );
+          continue;
+        }
+
+        // Re-emit
+        s.emit("chat", env);
+      }
+    };
+
     s.on("connect", () => {
       setStatus("connected");
       setStatusDetail("");
       setFromEngine();
+
+      // join and retry
       s.emit("join", roomRef.current);
+      flushPending();
     });
 
     s.on("disconnect", (reason) => {
@@ -100,7 +137,9 @@ export default function App() {
     s.on("chat_ack", (ack: ChatAck) => {
       if (!ack?.id) return;
 
-      pendingRef.current.delete(ack.id);
+      pendingIdsRef.current.delete(ack.id);
+      pendingMapRef.current.delete(ack.id);
+      attemptRef.current.delete(ack.id);
 
       setMessages((prev) =>
         prev.map((m) => {
@@ -112,7 +151,7 @@ export default function App() {
     });
 
     s.on("chat", (msg: ChatEnvelope) => {
-      // Dedupe by id (server may rebroadcast or client may reconnect/retry later)
+      // Dedupe receive
       if (seenRef.current.has(msg.id)) return;
       seenRef.current.add(msg.id);
 
@@ -144,7 +183,7 @@ export default function App() {
     const body = text.trim();
     if (!body) return;
 
-    const msg: ChatEnvelope = {
+    const env: ChatEnvelope = {
       id: uuid(),
       room,
       from,
@@ -152,18 +191,25 @@ export default function App() {
       body
     };
 
-    pendingRef.current.add(msg.id);
+    // Track pending
+    pendingIdsRef.current.add(env.id);
+    pendingMapRef.current.set(env.id, env);
+    attemptRef.current.set(env.id, 0);
 
-    // Add locally for immediate UX; ack will flip delivery -> sent/failed
-    setMessages((prev) => [...prev, { ...msg, delivery: "pending" }]);
+    // optimistic add
+    setMessages((prev) => [...prev, { ...env, delivery: "pending" }]);
 
-    s.emit("chat", msg);
+    // Ensure membership for current room
+    s.emit("join", room);
+
+    // send
+    s.emit("chat", env);
     setText("");
   }
 
   return (
     <div style={{ maxWidth: 720, margin: "24px auto", fontFamily: "system-ui" }}>
-      <h1>N̷e̷i̷g̷h̷b̷o̷r̷h̷o̷o̷d̷ W̷a̷t̷c̷h̷</h1>
+      <h1>N̷e̷i̷g̷h̷b̷o̷r̷h̷o̷o̷d̷ W̷a̷t̷c̷h̷ </h1>
 
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
         <label>

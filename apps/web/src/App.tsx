@@ -1,10 +1,10 @@
-// apps/web/src/App.tsx
 import { useEffect, useMemo, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
 import type {
   ChatAck,
   ChatEnvelope,
   ClientToServerEvents,
+  JoinAck,
   ServerToClientEvents
 } from "@ac/protocol";
 
@@ -21,7 +21,7 @@ type Direction = "outgoing" | "incoming";
 type ChatItem = ChatEnvelope & {
   delivery?: Delivery;
   error?: string;
-  direction?: Direction;
+  direction?: Direction; // set in handlers, never computed from refs in render
 };
 
 const ROOM_PRESETS = [
@@ -42,29 +42,20 @@ const ROOM_LOOKUP = new Map<string, RoomId>(
   ])
 );
 
-function normalizeRoom(raw: string | null | undefined): RoomId | null {
+function normalizeRoomFromUrl(raw: string | null | undefined): RoomId | null {
   if (!raw) return null;
   const key = raw.trim().toLowerCase();
   return ROOM_LOOKUP.get(key) ?? null;
 }
 
-function roomLabel(id: string): string {
-  const hit = ROOM_PRESETS.find((r) => r.value === id);
-  return hit ? hit.label : id;
-}
-
 function getInitialRoom(): RoomId {
   const params = new URLSearchParams(window.location.search);
-  return normalizeRoom(params.get("room")) ?? "family";
+  return normalizeRoomFromUrl(params.get("room")) ?? "family";
 }
 
 function getInitialToken(): string {
   const params = new URLSearchParams(window.location.search);
-  return (
-    params.get("token") ??
-    (import.meta.env.VITE_INVITE_TOKEN as string | undefined) ??
-    ""
-  );
+  return params.get("token") ?? (import.meta.env.VITE_INVITE_TOKEN as string | undefined) ?? "";
 }
 
 // engine.io internals: dev-only visibility without `any`
@@ -81,76 +72,140 @@ function readName(v: unknown): string | undefined {
   return typeof name === "string" ? name : undefined;
 }
 
+type RoomJoinState =
+  | { room: string; phase: "unknown" }
+  | { room: string; phase: "joining" }
+  | { room: string; phase: "joined" }
+  | { room: string; phase: "denied"; reason: string; allowedRooms?: string[] };
+
 export default function App() {
   const [roomPreset, setRoomPreset] = useState<RoomId>(() => getInitialRoom());
-  const token = useMemo(() => getInitialToken(), []);
+  const [token] = useState<string>(() => getInitialToken());
 
   const [from, setFrom] = useState("laptop");
   const [text, setText] = useState("");
   const [messages, setMessages] = useState<ChatItem[]>([]);
 
-  // initialize status from token (avoids setState synchronously in effect)
-  const [status, setStatus] = useState<ConnStatus>(() => (token ? "connecting" : "error"));
+  const hasToken = Boolean(token);
+
+  // init status from token (avoids setState-in-effect lint warning)
+  const [status, setStatus] = useState<ConnStatus>(() => (hasToken ? "connecting" : "error"));
   const [statusDetail, setStatusDetail] = useState(() =>
-    token ? "" : "missing_invite_token (use ?token=... or VITE_INVITE_TOKEN)"
+    hasToken ? "" : "missing_invite_token (use ?token=... or VITE_INVITE_TOKEN)"
   );
+
   const [transport, setTransport] = useState<string>("");
+  const [roomJoin, setRoomJoin] = useState<RoomJoinState>(() => ({ room: roomPreset, phase: "unknown" }));
 
   const room = roomPreset;
 
-  const socketRef =
-    useRef<Socket<ServerToClientEvents, ClientToServerEvents> | null>(null);
-  const roomRef = useRef(room);
+  const socketRef = useRef<Socket<ServerToClientEvents, ClientToServerEvents> | null>(null);
+  const roomRef = useRef<string>(room);
 
-  // which rooms we have asked the relay to join on *this* connection
+  // joined-room bookkeeping (client-side)
   const joinedRoomsRef = useRef(new Set<string>());
+  const joinInflightRef = useRef(new Map<string, Promise<JoinAck>>());
 
   // Delivery tracking
   const pendingIdsRef = useRef(new Set<string>());
   const pendingMapRef = useRef(new Map<string, ChatEnvelope>()); // id -> envelope
-
-  // retry bookkeeping
   const attemptRef = useRef(new Map<string, number>()); // id -> attempts
   const RETRY_MAX = 5;
 
-  // Dedupe receive (in case of reconnect/replay)
+  // Dedupe receive
   const seenRef = useRef(new Set<string>());
 
-  // Track ids created locally (for received vs sent labeling)
+  // Track ids created locally (so echoed broadcasts don’t render as "received")
   const localIdsRef = useRef(new Set<string>());
 
-  const visibleMessages = useMemo(() => {
-    return messages.filter((m) => m.room === room);
-  }, [messages, room]);
+  const visibleMessages = useMemo(() => messages.filter((m) => m.room === room), [messages, room]);
 
   const shareUrl = useMemo(() => {
     if (!token) return "";
     const u = new URL(window.location.href);
-    u.searchParams.set("room", room); // share canonical value (relay allowlist expects this)
+    u.searchParams.set("room", room); // stable id, not label
     u.searchParams.set("token", token);
     return u.toString();
   }, [room, token]);
 
-  function ensureJoined(r: string): void {
-    const s = socketRef.current;
-    if (!s?.connected) return;
-    if (joinedRoomsRef.current.has(r)) return;
-    s.emit("join", r);
-    joinedRoomsRef.current.add(r);
-  }
-
-  // keep latest room for connect handler + join on room changes
+  // keep ref in sync
   useEffect(() => {
     roomRef.current = room;
-    ensureJoined(room);
-    
   }, [room]);
 
-  useEffect(() => {
-    if (!token) {
-      // already reflected in initial state; do not setState synchronously here
-      return;
+  const joinRoom = (r: string): Promise<JoinAck> => {
+    const s = socketRef.current;
+
+    if (!s || !s.connected) {
+      return Promise.resolve({ room: r, ok: false, reason: "not_connected" });
     }
+
+    if (joinedRoomsRef.current.has(r)) {
+      return Promise.resolve({ room: r, ok: true });
+    }
+
+    const inflight = joinInflightRef.current.get(r);
+    if (inflight) return inflight;
+
+    // UI: if the user is trying to join the active room, show "joining"
+    if (roomRef.current === r) setRoomJoin({ room: r, phase: "joining" });
+
+    const p = new Promise<JoinAck>((resolve) => {
+      let settled = false;
+
+      const timer = window.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        joinInflightRef.current.delete(r);
+
+        const res: JoinAck = { room: r, ok: false, reason: "no_ack" };
+        if (roomRef.current === r) {
+          setRoomJoin({ room: r, phase: "denied", reason: "no_ack" });
+        }
+        resolve(res);
+      }, 1500);
+
+      s.emit("join", r, (ack?: JoinAck) => {
+        if (settled) return;
+        settled = true;
+
+        window.clearTimeout(timer);
+        joinInflightRef.current.delete(r);
+
+        const res: JoinAck =
+          ack && typeof ack === "object"
+            ? ack
+            : { room: r, ok: false, reason: "bad_ack" };
+
+        if (res.ok) {
+          joinedRoomsRef.current.add(r);
+          if (roomRef.current === r) setRoomJoin({ room: r, phase: "joined" });
+        } else {
+          if (roomRef.current === r) {
+            setRoomJoin({
+              room: r,
+              phase: "denied",
+              reason: res.reason ?? "join_denied",
+              allowedRooms: res.allowedRooms
+            });
+          }
+        }
+
+        resolve(res);
+      });
+    });
+
+    joinInflightRef.current.set(r, p);
+    return p;
+  };
+
+  const ensureJoined = async (r: string): Promise<boolean> => {
+    const res = await joinRoom(r);
+    return Boolean(res.ok);
+  };
+
+  useEffect(() => {
+    if (!hasToken) return;
 
     const s = io(RELAY_URL, {
       transports: ["websocket", "polling"],
@@ -173,8 +228,18 @@ export default function App() {
       else setFromEngine();
     };
 
-    const flushPending = () => {
-      // group by room so we can ensure membership first
+    const markPendingFailed = (id: string, reason: string) => {
+      pendingIdsRef.current.delete(id);
+      pendingMapRef.current.delete(id);
+      attemptRef.current.delete(id);
+
+      setMessages((prev) =>
+        prev.map((m) => (m.id === id ? { ...m, delivery: "failed", error: reason } : m))
+      );
+    };
+
+    const flushPending = async () => {
+      // group by room
       const byRoom = new Map<string, ChatEnvelope[]>();
       for (const id of pendingIdsRef.current) {
         const env = pendingMapRef.current.get(id);
@@ -185,31 +250,25 @@ export default function App() {
       }
 
       for (const [r, envs] of byRoom) {
-        ensureJoined(r);
+        const ok = await ensureJoined(r);
+        if (!ok) {
+          // fail all pending for that room
+          for (const env of envs) markPendingFailed(env.id, "join_denied");
+          continue;
+        }
 
         for (const env of envs) {
           const attempts = (attemptRef.current.get(env.id) ?? 0) + 1;
           attemptRef.current.set(env.id, attempts);
 
           if (attempts > RETRY_MAX) {
-            pendingIdsRef.current.delete(env.id);
-            pendingMapRef.current.delete(env.id);
-            attemptRef.current.delete(env.id);
-
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === env.id ? { ...m, delivery: "failed", error: "retry_limit" } : m
-              )
-            );
+            markPendingFailed(env.id, "retry_limit");
             continue;
           }
 
           s.emit("chat", env);
         }
       }
-
-      // also (re)join current room after reconnect
-      ensureJoined(roomRef.current);
     };
 
     s.on("connect", () => {
@@ -217,11 +276,15 @@ export default function App() {
       setStatusDetail("");
       setFromEngine();
 
-      // new connection => previous membership is gone
+      // membership is effectively unknown after reconnect: clear local join cache
       joinedRoomsRef.current.clear();
+      joinInflightRef.current.clear();
 
-      ensureJoined(roomRef.current);
-      flushPending();
+      // join the active room
+      void ensureJoined(roomRef.current);
+
+      // retry pending messages
+      void flushPending();
     });
 
     s.on("disconnect", (reason) => {
@@ -257,7 +320,7 @@ export default function App() {
 
       const isLocal = localIdsRef.current.has(msg.id);
       const patch: Partial<ChatItem> = isLocal
-        ? { direction: "outgoing" }
+        ? { direction: "outgoing" } // keep your outgoing label
         : { direction: "incoming", delivery: undefined, error: "" };
 
       setMessages((prev) => {
@@ -279,16 +342,38 @@ export default function App() {
       s.disconnect();
       socketRef.current = null;
     };
-    // token is stable (memoized)
-   
-  }, [token]);
+  }, [hasToken, token]);
 
-  function send() {
+  const canSend =
+    status === "connected" &&
+    roomJoin.phase === "joined" &&
+    roomJoin.room === room;
+
+  function onRoomChange(next: RoomId) {
+    setRoomPreset(next);
+    roomRef.current = next; // keep ref in sync immediately for joinRoom UI updates
+
+    const s = socketRef.current;
+    if (s?.connected) {
+      void ensureJoined(next);
+    } else {
+      setRoomJoin({ room: next, phase: "unknown" });
+    }
+  }
+
+  async function sendAsync() {
     const s = socketRef.current;
     if (!s) return;
 
     const body = text.trim();
     if (!body) return;
+
+    // ensure join before sending (so relay doesn't deny)
+    const ok = await ensureJoined(room);
+    if (!ok) {
+      setRoomJoin((prev) => (prev.room === room ? prev : { room, phase: "denied", reason: "join_denied" }));
+      return;
+    }
 
     const env: ChatEnvelope = {
       id: uuid(),
@@ -304,13 +389,15 @@ export default function App() {
     pendingMapRef.current.set(env.id, env);
     attemptRef.current.set(env.id, 0);
 
+    // optimistic add
     setMessages((prev) => [...prev, { ...env, delivery: "pending", direction: "outgoing" }]);
-
-    // membership enforcement on relay: join before chat
-    ensureJoined(room);
 
     s.emit("chat", env);
     setText("");
+  }
+
+  function send() {
+    void sendAsync();
   }
 
   return (
@@ -320,7 +407,7 @@ export default function App() {
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
         <label>
           Room{" "}
-          <select value={roomPreset} onChange={(e) => setRoomPreset(e.target.value as RoomId)}>
+          <select value={roomPreset} onChange={(e) => onRoomChange(e.target.value as RoomId)}>
             {ROOM_PRESETS.map((r) => (
               <option key={r.value} value={r.value}>
                 {r.label}
@@ -340,9 +427,29 @@ export default function App() {
         </div>
       </div>
 
+      <div style={{ marginTop: 8, fontSize: 12, opacity: 0.85 }}>
+        Room join:{" "}
+        {roomJoin.room !== room ? (
+          <span>unknown</span>
+        ) : roomJoin.phase === "joined" ? (
+          <span>joined</span>
+        ) : roomJoin.phase === "joining" ? (
+          <span>joining…</span>
+        ) : roomJoin.phase === "denied" ? (
+          <span>
+            denied ({roomJoin.reason})
+            {roomJoin.allowedRooms?.length ? (
+              <span> • allowed: {roomJoin.allowedRooms.join(", ")}</span>
+            ) : null}
+          </span>
+        ) : (
+          <span>unknown</span>
+        )}
+      </div>
+
       {token ? (
         <div style={{ marginTop: 10, opacity: 0.85, fontSize: 12 }}>
-          Invite link (share):{" "}
+          Invite link (share):
           <input style={{ width: "100%", marginTop: 6 }} readOnly value={shareUrl} />
         </div>
       ) : null}
@@ -355,25 +462,19 @@ export default function App() {
           onKeyDown={(e) => e.key === "Enter" && send()}
           placeholder="Type a message…"
         />
-        <button onClick={send} disabled={status !== "connected"}>
+        <button onClick={send} disabled={!canSend}>
           Send
         </button>
       </div>
 
       <div style={{ marginTop: 16 }}>
         {visibleMessages.map((m) => {
-          const label =
-            m.direction === "incoming"
-              ? "received"
-              : m.delivery
-              ? m.delivery
-              : "sent";
+          const label = m.direction === "incoming" ? "received" : m.delivery ?? "sent";
 
           return (
             <div key={m.id} style={{ padding: "8px 0", borderBottom: "1px solid #ddd" }}>
               <div style={{ fontSize: 12, opacity: 0.7 }}>
-                [{roomLabel(m.room)}] {m.from} • {new Date(m.sentAt).toLocaleTimeString()} •{" "}
-                {label}
+                [{m.room}] {m.from} • {new Date(m.sentAt).toLocaleTimeString()} • {label}
                 {label === "failed" && m.error ? ` (${m.error})` : ""}
               </div>
               <div>{m.body}</div>

@@ -7,6 +7,7 @@ import type {
   ChatAck,
   ChatEnvelope,
   ClientToServerEvents,
+  JoinAck,
   ServerToClientEvents
 } from "@ac/protocol";
 
@@ -19,44 +20,22 @@ const CLIENT_ORIGINS = (process.env.CLIENT_ORIGIN ??
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Invite-only tokens (comma-separated list supported)
-const INVITE_TOKENS = (process.env.INVITE_TOKENS ?? process.env.INVITE_TOKEN ?? "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-if (INVITE_TOKENS.length === 0) {
-  console.error("[relay] Missing INVITE_TOKEN (or INVITE_TOKENS). Refusing to start.");
-  console.error(
-    `[relay] Example (PowerShell): $env:INVITE_TOKEN="my-family-2025"; npm -w apps/relay run dev`
-  );
-  process.exit(1);
+function parseList(raw: string | undefined): string[] {
+  return (raw ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
-// Allowlisted rooms (server-side enforcement)
-const ROOM_PRESETS = [
-  "emergency",
-  "family",
-  "vacant-1",
-  "vacant-2",
-  "vacant-3",
-  "vacant-4"
-] as const;
+// Rooms: allowlist (lowercase ids)
+const DEFAULT_ROOMS = ["emergency", "family", "vacant-1", "vacant-2", "vacant-3", "vacant-4"];
+const ALLOWED_ROOMS = parseList(process.env.ALLOWED_ROOMS).map((r) => r.toLowerCase());
+const ROOM_LIST = (ALLOWED_ROOMS.length ? ALLOWED_ROOMS : DEFAULT_ROOMS).map((r) => r.toLowerCase());
+const ROOM_SET = new Set(ROOM_LIST);
 
-type RoomId = (typeof ROOM_PRESETS)[number];
-const ALLOWED_ROOMS = new Set<string>(ROOM_PRESETS);
-
-function normalizeRoom(raw: unknown): RoomId | null {
-  if (typeof raw !== "string") return null;
-  const r = raw.trim().toLowerCase();
-  return ALLOWED_ROOMS.has(r) ? (r as RoomId) : null;
-}
-
-function readToken(auth: unknown): string | undefined {
-  if (!auth || typeof auth !== "object") return undefined;
-  const token = (auth as Record<string, unknown>).token;
-  return typeof token === "string" ? token : undefined;
-}
+// Invite-only (optional)
+const INVITE_TOKENS = new Set(parseList(process.env.INVITE_TOKENS));
+const INVITE_ONLY = INVITE_TOKENS.size > 0;
 
 // Basic message limits (cheap safety net)
 const LIMITS = {
@@ -67,13 +46,7 @@ const LIMITS = {
 
 const ChatEnvelopeSchema = z.object({
   id: z.string().min(1),
-  // normalize + allowlist
-  room: z
-    .string()
-    .min(1)
-    .max(LIMITS.roomMax)
-    .transform((s) => s.trim().toLowerCase())
-    .refine((s) => ALLOWED_ROOMS.has(s), { message: "invalid_room" }),
+  room: z.string().min(1).max(LIMITS.roomMax),
   from: z.string().min(1).max(LIMITS.fromMax),
   sentAt: z.number().int().nonnegative(),
   body: z.string().min(1).max(LIMITS.bodyMax)
@@ -102,6 +75,11 @@ function extractId(raw: unknown): string {
   return typeof id === "string" ? id : "";
 }
 
+function normalizeRoom(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  return raw.trim().toLowerCase();
+}
+
 const app = express();
 app.use(cors({ origin: CLIENT_ORIGINS, credentials: true }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
@@ -112,13 +90,22 @@ const io = new Server<ClientToServerEvents, ServerToClientEvents>(server, {
   cors: { origin: CLIENT_ORIGINS, credentials: true }
 });
 
-// Invite-only: block socket connection if token invalid
+// Invite gate (connect-time)
 io.use((socket, next) => {
-  const token = readToken(socket.handshake.auth);
-  if (!token || !INVITE_TOKENS.includes(token)) {
+  if (!INVITE_ONLY) return next();
+
+  const auth = socket.handshake.auth as unknown;
+  const token =
+    auth && typeof auth === "object"
+      ? (auth as Record<string, unknown>).token
+      : undefined;
+
+  const tokenStr = typeof token === "string" ? token : "";
+
+  if (!tokenStr || !INVITE_TOKENS.has(tokenStr)) {
     return next(new Error("unauthorized"));
   }
-  next();
+  return next();
 });
 
 io.on("connection", (socket) => {
@@ -129,15 +116,24 @@ io.on("connection", (socket) => {
     console.log(`[relay] disconnect id=${socket.id} reason=${reason}`);
   });
 
-  socket.on("join", (rawRoom) => {
+  socket.on("join", (rawRoom: string, ack?: (ack: JoinAck) => void) => {
     const room = normalizeRoom(rawRoom);
+
     if (!room) {
-      console.log(`[relay] join_reject id=${socket.id} room=${String(rawRoom)} reason=invalid_room`);
+      console.log(`[relay] join-deny id=${socket.id} room=${String(rawRoom)} reason=invalid_room`);
+      ack?.({ room: String(rawRoom ?? ""), ok: false, reason: "invalid_room", allowedRooms: ROOM_LIST });
+      return;
+    }
+
+    if (!ROOM_SET.has(room)) {
+      console.log(`[relay] join-deny id=${socket.id} room=${room} reason=room_not_allowed`);
+      ack?.({ room, ok: false, reason: "room_not_allowed", allowedRooms: ROOM_LIST });
       return;
     }
 
     socket.join(room);
     console.log(`[relay] join id=${socket.id} room=${room}`);
+    ack?.({ room, ok: true });
   });
 
   socket.on("chat", (raw: ChatEnvelope) => {
@@ -152,21 +148,25 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const msg = parsed.data; // room is already normalized/allowlisted by schema
+    const msg = parsed.data;
+    const room = normalizeRoom(msg.room);
 
-    // Membership enforcement: must be in the room you're sending to
-    if (!socket.rooms.has(msg.room)) {
-      console.log(
-        `[relay] deny id=${socket.id} msgId=${msg.id} room=${msg.room} reason=not_in_room`
-      );
-      const ack: ChatAck = { id: msg.id, ok: false, reason: "not_in_room" };
-      socket.emit("chat_ack", ack);
+    if (!room || !ROOM_SET.has(room)) {
+      console.log(`[relay] deny id=${socket.id} msgId=${msg.id} room=${String(msg.room)} reason=room_not_allowed`);
+      socket.emit("chat_ack", { id: msg.id, ok: false, reason: "room_not_allowed" });
+      return;
+    }
+
+    // Must be in the room you're sending to
+    if (!socket.rooms.has(room)) {
+      console.log(`[relay] deny id=${socket.id} msgId=${msg.id} room=${room} reason=not_in_room`);
+      socket.emit("chat_ack", { id: msg.id, ok: false, reason: "not_in_room" });
       return;
     }
 
     // Dedupe: ack OK but do not rebroadcast
     if (seenHas(msg.id)) {
-      console.log(`[relay] dedupe msgId=${msg.id} room=${msg.room} from=${msg.from}`);
+      console.log(`[relay] dedupe msgId=${msg.id} room=${room} from=${msg.from}`);
       socket.emit("chat_ack", { id: msg.id, ok: true });
       return;
     }
@@ -174,10 +174,11 @@ io.on("connection", (socket) => {
     seenAdd(msg.id);
 
     console.log(
-      `[relay] chat msgId=${msg.id} room=${msg.room} from=${msg.from} sentAt=${msg.sentAt} bytes=${msg.body.length}`
+      `[relay] chat msgId=${msg.id} room=${room} from=${msg.from} sentAt=${msg.sentAt} bytes=${msg.body.length}`
     );
 
-    io.to(msg.room).emit("chat", msg);
+    // Broadcast using normalized room
+    io.to(room).emit("chat", { ...msg, room });
     socket.emit("chat_ack", { id: msg.id, ok: true });
   });
 });
@@ -185,6 +186,6 @@ io.on("connection", (socket) => {
 server.listen(PORT, () => {
   console.log(`[relay] listening on http://127.0.0.1:${PORT}`);
   console.log(`[relay] allowing origins ${CLIENT_ORIGINS.join(", ")}`);
-  console.log(`[relay] invite-only enabled (tokens=${INVITE_TOKENS.length})`);
-  console.log(`[relay] rooms: ${ROOM_PRESETS.join(", ")}`);
+  console.log(`[relay] rooms: ${ROOM_LIST.join(", ")}`);
+  if (INVITE_ONLY) console.log(`[relay] invite-only enabled (tokens=${INVITE_TOKENS.size})`);
 });

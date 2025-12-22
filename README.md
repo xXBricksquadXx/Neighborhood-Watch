@@ -6,7 +6,8 @@ a Socket.IO relay + a Vite/React client + shared TypeScript protocol types.
 This repo is intentionally small so you can iterate toward:
 
 - invite-only group access (share a link with selected people)
-- resilient delivery patterns (ack/dedupe/retry)
+- allowlisted rooms (server-controlled room list)
+- predictable delivery semantics (ack/dedupe/retry)
 - eventual end-to-end encryption (relay becomes a blind forwarder)
 - alternative transports later (WebRTC/BLE/mesh), without rewriting the core UX
 
@@ -16,12 +17,12 @@ This repo is intentionally small so you can iterate toward:
 
 ```
 Neighborhood-Watch/
-  apps/
-    relay/          # Node + Express + Socket.IO server (message relay)
-    web/            # Vite + React client
-  packages/
-    protocol/       # Shared TS types (events + message envelope/ack)
-  package.json      # npm workspaces (monorepo)
+apps/
+relay/ # Node + Express + Socket.IO server (message relay)
+web/ # Vite + React client
+packages/
+protocol/ # Shared TS types (events + message envelope/acks)
+package.json # npm workspaces (monorepo)
 ```
 
 ---
@@ -44,30 +45,31 @@ npm -v
 
 Pin Node in this repo:
 
-```bash
+```
 volta install node@22.12.0
 volta pin node@22.12.0
+
 ```
 
 ---
 
-## Install
+**Install**
+From repo `root`:
 
-From repo root:
-
-```bash
+```
 npm install
 npm -w packages/protocol run build
+
 ```
 
 ---
 
-## Run (dev)
+Run (dev)
+Terminal A (relay)
 
-### Terminal A (relay)
-
-```bash
+```
 npm -w apps/relay run dev
+
 ```
 
 Relay:
@@ -77,15 +79,17 @@ Relay:
 
 Verify:
 
-```bash
+```
 curl http://127.0.0.1:8787/health
 # {"ok":true}
+
 ```
 
-### Terminal B (web)
+Terminal B (web)
 
-```bash
+```
 npm -w apps/web run dev
+
 ```
 
 Web (Vite dev server):
@@ -94,17 +98,67 @@ Web (Vite dev server):
 
 ---
 
-## Configuration
+**Access control (v0)**
 
-### Web client env
+v0 supports two layers:
+
+- Invite-only connect (handshake auth)
+- Allowlisted rooms (server-side allowed room set)
+
+**Invite-only connect (handshake token)**
+
+Set one or more tokens via `INVITE_TOKENS` (comma-separated).
+If `INVITE_TOKENS` is set (non-empty), the relay requires a token.
+
+PowerShell example (dev):
+
+```
+$env:INVITE_TOKENS="Crows-Nest"
+npm -w apps/relay run dev
+
+```
+
+Client provides the token either:
+
+- via URL: `?token=Crows-Nest`
+- or `apps/web/.env`: `VITE_INVITE_TOKEN=Crows-Nest`
+
+Allowlisted rooms
+
+Rooms are controlled by `ALLOWED_ROOMS` (comma-separated). If not set, defaults to:
+`emergency,family,vacant-1,vacant-2,vacant-3,vacant-4`
+
+Example: restrict to only emergency + family
+
+```
+$env:ALLOWED_ROOMS="emergency,family"
+npm -w apps/relay run dev
+
+```
+
+Behavior:
+
+`join(room)` returns an ack:
+
+- ok: `true` if joined
+- ok: `false` with reason and `allowedRooms` when denied
+
+## The web client surfaces this as Room join: joined / denied (room_not_allowed) and disables Send until joined.
+
+**Configuration**
+
+Web client env
 
 `apps/web/.env`
 
 ```env
 VITE_RELAY_URL=http://127.0.0.1:8787
+# optional convenience; you can still use ?token=...
+VITE_INVITE_TOKEN=Crows-Nest
+
 ```
 
-### Relay env
+Relay env
 
 Relay allows these dev origins by default:
 
@@ -113,160 +167,156 @@ Relay allows these dev origins by default:
 
 Override:
 
-```bash
+```
 PORT=8787
 CLIENT_ORIGIN="http://127.0.0.1:5173,http://localhost:5173"
+INVITE_TOKENS="Crows-Nest,Backup-Token"
+ALLOWED_ROOMS="emergency,family"
+
 ```
 
 ---
 
-## How it works
+Production build + run (local “prod mode”)
 
-### Shared protocol (`packages/protocol`)
+The simplest mental model: build everything once, then run the relay, and serve the web build.
+
+1. Build
+
+From repo root:
+
+```
+npm -w packages/protocol run build
+npm -w apps/relay run build
+npm -w apps/web run build
+
+```
+
+> Note: if apps/relay doesn’t yet have a build + start script, add them (typical pattern):
+>
+> - build: compile TS -> dist/
+> - start: node dist/index.js
+
+2. Run relay with env vars
+
+PowerShell example (prod run):
+
+```
+$env:PORT="8787"
+$env:CLIENT_ORIGIN="https://your-domain.example"
+$env:INVITE_TOKENS="Crows-Nest"
+$env:ALLOWED_ROOMS="emergency,family"
+
+npm -w apps/relay run start
+
+```
+
+If you want logs written to a file:
+
+```
+npm -w apps/relay run start 2>&1 | Tee-Object -FilePath .\relay.log
+
+```
+
+3. Serve the web build
+
+For Vite, the usual local production preview is:
+
+```
+npm -w apps/web run preview
+
+```
+
+Or serve `apps/web/dist/` using any static server.
+
+---
+
+# How it works
+
+Shared protocol (`packages/protocol`)
 
 Defines:
 
-- `ChatEnvelope`: `{ id, room, from, sentAt, body }`
-- `ChatAck`: `{ id, ok, reason? }`
-- Socket.IO event types for client/server
+- ChatEnvelope: { `id, room, from, sentAt, body `}
+- ChatAck: { `id, ok, reason?` }
+- JoinAck: { `room, ok, reason?, allowedRooms?` }
+- Socket.IO event types for client/server, including an ack callback on join
 
-### Relay (`apps/relay`)
+**Relay (apps/relay)**
 
 Flow:
 
-1. client connects
-2. client emits `join(room)`
-3. client emits `chat(envelope)`
-4. relay validates `envelope` (length/type checks)
-5. relay **enforces membership**: sender must have joined `envelope.room`
-6. relay **dedupes** by `envelope.id` (in-memory)
-7. relay broadcasts `chat(envelope)` to the room
-8. relay sends `chat_ack({id, ok, reason?})` back to the sender
+1. client connects (optionally must present invite token)
+
+2. client emits join(room, ack)
+
+3. relay validates + allowlists the room
+
+4. relay either:
+
+- `socket.join(room)` and acks ok
+- or acks denied with `reason + allowedRooms`
+
+5. client emits `chat(envelope)`
+
+6. relay validates envelope (length/type checks)
+
+7. relay enforces membership: sender must have joined `envelope.room`
+
+8. relay dedupes by `envelope.id` (in-memory)
+
+9. relay broadcasts `chat(envelope)` to the room
+
+10. relay sends `chat_ack({id, ok, reason?})` to the sender
 
 Notes:
 
-- v0 does **not** persist messages on the server
+- v0 does not persist messages on the server
 - dedupe is best-effort and resets on relay restart
 
-### Web client (`apps/web`)
+Web client (`apps/web`)
 
-- connects to relay via Socket.IO
-- joins the active room (preset dropdown)
-- sends typed envelopes
-- tracks delivery state via `chat_ack`:
-  - `pending` → `sent` (ack ok)
-  - `pending` → `failed` (ack reject) or retry limit reached
+- connects to relay via Socket.IO (auth token)
+- attempts to join the active room and waits for JoinAck
+- disables Send until the room is joined
+- tracks delivery state via chat_ack:
+- pending → sent (ack ok)
+- pending → failed (ack reject) or retry limit reached
 - retries pending messages after reconnect (bounded)
-- labels messages as:
-  - `received` (incoming)
-  - `pending/sent/failed` (outgoing)
+- surfaces room join denial reasons + allowed rooms list
 
 ---
 
-## Sanity checks
+## Next milestones (core-first)
 
-### Two-instance test (recommended)
+**Milestone 1** — `Access control hardening`
 
-- Open **two tabs**:
-  - Tab A: room `Emergency`, from `laptop`
-  - Tab B: room `Emergency`, from `phone`
-- Send messages from each; both should see them.
-- Switch Tab B to a different room; messages should **not** bleed across rooms.
+- multiple tokens + rotation/revocation (already supported via INVITE_TOKENS)
+- room-scoped tokens (token grants access to a subset of rooms)
+- basic audit logging: unauthorized connect attempts + denied joins
+- DoD: you can invalidate one leaked link without breaking everyone else
 
-Tip: easiest isolation is one normal window + one private/incognito window.
+**Milestone 2** — `Reliability semantics`
 
-### Resilience test: kill relay
+- client: pending queue survives refresh (IndexedDB) + retries with backoff
+- relay: dedupe evicts by age, not only by max size
+- optional: server adds serverReceivedAt/seq per room for stable ordering
+- DoD: kill relay, restart, clients reconnect, pending messages resend or fail deterministically
 
-- Send a message while relay is down (it stays `pending`)
-- Restart relay
-- Client reconnects and replays pending messages (up to retry limit)
+**Milestone 3** — `Persistence (optional)`
 
----
+- start client-only (IndexedDB) so it’s free and simple
+- later: relay persistence (SQLite) if you need multi-device history
+- DoD: reload page, history is still there
 
-## Troubleshooting
+**Milestone 4** — `Security posture for “shareable link”`
 
-### “Cannot access refs during render” (React)
+- HTTPS (required for many browser APIs later)
+- rate limiting + abuse protection
+- tighten CORS to real domains once deployed
+- DoD: you can deploy and share a link without “open relay” risk
 
-Avoid reading `ref.current` inside render/JSX. Stamp needed values into state when events occur.
+**Milestone 5** — `Alternative transports (later)`
 
-### CORS / connection issues
-
-- Use `VITE_RELAY_URL=http://127.0.0.1:8787`
-- Ensure relay allows both `localhost` and `127.0.0.1` origins (default behavior).
-
-### npm workspace installs
-
-Prefer one of these (from repo root):
-
-```bash
-npm install zod -w apps/relay
-# or
-npm -w apps/relay install zod
-```
-
-If you `cd apps/relay`, do **not** use `-w`:
-
-```bash
-cd apps/relay
-npm install zod
-```
-
----
-
-# Next milestones (core-first)
-
-# **Milestone 1** — `Access control hardening (next)`
-
-> Goal: “Invite-only” stops being a single shared secret and becomes manageable.
-
-> Multiple tokens, rotation, and revocation (no code changes required to clients beyond link token).
-
-> per-room tokens (token grants access to a subset of rooms, not all rooms).
-
-> Basic audit logging: unauthorized connect attempts + denied joins.
-
-> Definition of done: you can invalidate one leaked link without breaking everyone else.
-
-# **Milestone 2** — `Reliability semantics (next)`
-
-> Goal: the app behaves predictably across refreshes, relay restarts, flaky networks.
-
-> Client: pending queue survives refresh (IndexedDB) + retries with backoff.
-
-> Relay: dedupe should be time-bounded (evict by age, not only by max size).
-
-> Optional: server adds serverReceivedAt or seq per room so ordering is consistent.
-
-> Definition of done: kill relay, restart, clients reconnect, pending messages either resend or fail deterministically.
-
-# **Milestone 3** — `Persistence (optional but big)`
-
-> Goal: you can load message history for a room.
-
-> Start client-only (IndexedDB) so it’s free and simple.
-
-> Later: relay persistence (SQLite) if you need multi-device history.
-
-> Definition of done: reload page, history is still there.
-
-# **Milestone 4** — `Security posture for “shareable link”`
-
-> Goal: safe enough to hand to trusted people without surprises.
-
-> Run behind HTTPS (required for many browser APIs later).
-
-> Rate limiting + abuse protection.
-
-> CORS tightened to real domains once deployed.
-
-> Definition of done: you can deploy and share a link without “open relay” risk.
-
-# **Milestone 5** — `Alternative transports (later)`
-
-> Goal: the “alt connectivity” part.
-
-> WebRTC datachannel fallback when internet is available but relay is blocked.
-
-> Local-first / store-and-forward strategies.
-
----
+- WebRTC datachannel fallback
+- local-first / store-and-forward strategies

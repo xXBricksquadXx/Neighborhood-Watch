@@ -1,4 +1,5 @@
-# Neighborhood-Watch (Alt Connectivity v0)
+<img width="1536" height="1024" alt="watch" src="https://github.com/user-attachments/assets/a1483d15-64b5-47db-92d2-b81081bd638c" />
+---
 
 A minimal real-time “private group comms” starter focused on **low-overhead experimentation**:
 a Socket.IO relay + a Vite/React client + shared TypeScript protocol types.

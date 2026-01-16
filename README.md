@@ -182,7 +182,7 @@ Override:
 ```env
 PORT=8787
 CLIENT_ORIGIN="http://127.0.0.1:5173,http://localhost:5173"
-INVITE_TOKENS="Crows-Nest,Backup-Token"
+INVITE_TOKENS="Alpha-Team,Backup-Token"
 ALLOWED_ROOMS="emergency,TOC"
 ```
 

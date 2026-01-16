@@ -1,16 +1,31 @@
 <img width="1536" height="1024" alt="watch" src="https://github.com/user-attachments/assets/a1483d15-64b5-47db-92d2-b81081bd638c" />
+
+# Neighborhood-Watch
+
+A minimal real-time **private-group comms + Common Operating Picture (COP)** starter:
+
+- Socket.IO relay
+- Vite/React web client
+- shared TypeScript protocol package
+
+Designed for **low-overhead experimentation** today, with a clear path toward a modern, governance-first “BFT-inspired” workflow: **mission packages (“fills”), map overlays/routes, incident reporting, and role-based visibility**.
+
 ---
 
-A minimal real-time “private group comms” starter focused on **low-overhead experimentation**:
-a Socket.IO relay + a Vite/React client + shared TypeScript protocol types.
+## TL;DR
 
-This repo is intentionally small so you can iterate toward:
+- **What it is (v0):** invite-only chat rooms with allowlisted rooms + acks/dedupe/retry.
+- **What it’s becoming:** a **trusted-team COP**: map + overlays + incident workspace + controlled distribution ("fills").
+- **Why:** teams don’t fail from UI — they fail from inconsistent data, unclear roles, and no shared picture.
 
-- invite-only group access (share a link with selected people)
-- allowlisted rooms (server-controlled room list)
-- predictable delivery semantics (ack/dedupe/retry)
-- eventual end-to-end encryption (relay becomes a blind forwarder)
-- alternative transports later (WebRTC/BLE/mesh), without rewriting the core UX
+---
+
+## Principles
+
+- **Governance-first:** identity, enrollment, RBAC, auditability, and retention controls are primary features.
+- **Transport-agnostic:** the app layer stays stable; transport becomes a replaceable module (internet now, local/degraded later).
+- **Privacy by default:** location sharing is opt-in, scoped, and minimized.
+- **Legit use-cases:** oriented toward **mutual aid / volunteer response / community CERT-style coordination / organizational teams**.
 
 ---
 
@@ -18,12 +33,12 @@ This repo is intentionally small so you can iterate toward:
 
 ```
 Neighborhood-Watch/
-apps/
-relay/ # Node + Express + Socket.IO server (message relay)
-web/ # Vite + React client
-packages/
-protocol/ # Shared TS types (events + message envelope/acks)
-package.json # npm workspaces (monorepo)
+  apps/
+    relay/          # Node + Express + Socket.IO server (message relay)
+    web/            # Vite + React client
+  packages/
+    protocol/       # Shared TS types (events + message envelope/ack)
+  package.json      # npm workspaces (monorepo)
 ```
 
 ---
@@ -46,31 +61,30 @@ npm -v
 
 Pin Node in this repo:
 
-```
+```bash
 volta install node@22.12.0
 volta pin node@22.12.0
-
 ```
 
 ---
 
-**Install**
+## Install
+
 From repo `root`:
 
-```
+```bash
 npm install
 npm -w packages/protocol run build
-
 ```
 
 ---
 
-Run (dev)
-Terminal A (relay)
+## Run (dev)
 
-```
+### Terminal A (relay)
+
+```bash
 npm -w apps/relay run dev
-
 ```
 
 Relay:
@@ -80,17 +94,15 @@ Relay:
 
 Verify:
 
-```
+```bash
 curl http://127.0.0.1:8787/health
 # {"ok":true}
-
 ```
 
-Terminal B (web)
+### Terminal B (web)
 
-```
+```bash
 npm -w apps/web run dev
-
 ```
 
 Web (Vite dev server):
@@ -99,42 +111,40 @@ Web (Vite dev server):
 
 ---
 
-**Access control (v0)**
+## Access control (v0)
 
 v0 supports two layers:
 
 - Invite-only connect (handshake auth)
-- Allowlisted rooms (server-side allowed room set)
+- Allowlisted rooms (server-controlled room list)
 
-**Invite-only connect (handshake token)**
+### Invite-only connect (handshake token)
 
 Set one or more tokens via `INVITE_TOKENS` (comma-separated).
 If `INVITE_TOKENS` is set (non-empty), the relay requires a token.
 
 PowerShell example (dev):
 
-```
-$env:INVITE_TOKENS="Crows-Nest"
+```powershell
+$env:INVITE_TOKENS="Alpha-Team"
 npm -w apps/relay run dev
-
 ```
 
 Client provides the token either:
 
-- via URL: `?token=Crows-Nest`
-- or `apps/web/.env`: `VITE_INVITE_TOKEN=Crows-Nest`
+- via URL: `?token=Alpha-Team`
+- or `apps/web/.env`: `VITE_INVITE_TOKEN=Alpha-Team`
 
-Allowlisted rooms
+### Allowlisted rooms
 
 Rooms are controlled by `ALLOWED_ROOMS` (comma-separated). If not set, defaults to:
-`emergency,family,vacant-1,vacant-2,vacant-3,vacant-4`
+`emergency,TOC,vacant-1,vacant-2,vacant-3,vacant-4`
 
-Example: restrict to only emergency + family
+Example: restrict to only emergency + TOC
 
-```
-$env:ALLOWED_ROOMS="emergency,family"
+```powershell
+$env:ALLOWED_ROOMS="emergency,TOC"
 npm -w apps/relay run dev
-
 ```
 
 Behavior:
@@ -144,22 +154,23 @@ Behavior:
 - ok: `true` if joined
 - ok: `false` with reason and `allowedRooms` when denied
 
-## The web client surfaces this as Room join: joined / denied (room_not_allowed) and disables Send until joined.
+The web client surfaces this as Room join: joined / denied (`room_not_allowed`) and disables Send until joined.
 
-**Configuration**
+---
 
-Web client env
+## Configuration
+
+### Web client env
 
 `apps/web/.env`
 
 ```env
 VITE_RELAY_URL=http://127.0.0.1:8787
 # optional convenience; you can still use ?token=...
-VITE_INVITE_TOKEN=Crows-Nest
-
+VITE_INVITE_TOKEN=Alpha-Team
 ```
 
-Relay env
+### Relay env
 
 Relay allows these dev origins by default:
 
@@ -168,106 +179,89 @@ Relay allows these dev origins by default:
 
 Override:
 
-```
+```env
 PORT=8787
 CLIENT_ORIGIN="http://127.0.0.1:5173,http://localhost:5173"
 INVITE_TOKENS="Crows-Nest,Backup-Token"
-ALLOWED_ROOMS="emergency,family"
-
+ALLOWED_ROOMS="emergency,TOC"
 ```
 
 ---
 
-Production build + run (local “prod mode”)
+## Production build + run (local “prod mode”)
 
 The simplest mental model: build everything once, then run the relay, and serve the web build.
 
-1. Build
+1. Build (from repo root):
 
-From repo root:
-
-```
+```bash
 npm -w packages/protocol run build
 npm -w apps/relay run build
 npm -w apps/web run build
-
 ```
 
-> Note: if apps/relay doesn’t yet have a build + start script, add them (typical pattern):
+> Note: if `apps/relay` doesn’t yet have a build + start script, add them (typical pattern):
 >
 > - build: compile TS -> dist/
 > - start: node dist/index.js
 
-2. Run relay with env vars
+2. Run relay with env vars (PowerShell example):
 
-PowerShell example (prod run):
-
-```
+```powershell
 $env:PORT="8787"
 $env:CLIENT_ORIGIN="https://your-domain.example"
-$env:INVITE_TOKENS="Crows-Nest"
-$env:ALLOWED_ROOMS="emergency,family"
+$env:INVITE_TOKENS="Alpha-Team"
+$env:ALLOWED_ROOMS="emergency,TOC"
 
 npm -w apps/relay run start
-
 ```
 
 If you want logs written to a file:
 
-```
+```powershell
 npm -w apps/relay run start 2>&1 | Tee-Object -FilePath .\relay.log
-
 ```
 
 3. Serve the web build
 
 For Vite, the usual local production preview is:
 
-```
+```bash
 npm -w apps/web run preview
-
 ```
 
 Or serve `apps/web/dist/` using any static server.
 
 ---
 
-# How it works
+# How it works (v0)
 
-Shared protocol (`packages/protocol`)
+## Shared protocol (`packages/protocol`)
 
 Defines:
 
-- ChatEnvelope: { `id, room, from, sentAt, body `}
-- ChatAck: { `id, ok, reason?` }
-- JoinAck: { `room, ok, reason?, allowedRooms?` }
+- `ChatEnvelope`: `{ id, room, from, sentAt, body }`
+- `ChatAck`: `{ id, ok, reason? }`
+- `JoinAck`: `{ room, ok, reason?, allowedRooms? }`
 - Socket.IO event types for client/server, including an ack callback on join
 
-**Relay (apps/relay)**
+## Relay (`apps/relay`)
 
 Flow:
 
 1. client connects (optionally must present invite token)
-
-2. client emits join(room, ack)
-
+2. client emits `join(room, ack)`
 3. relay validates + allowlists the room
-
 4. relay either:
 
-- `socket.join(room)` and acks ok
-- or acks denied with `reason + allowedRooms`
+   - `socket.join(room)` and acks ok
+   - or acks denied with `reason + allowedRooms`
 
 5. client emits `chat(envelope)`
-
 6. relay validates envelope (length/type checks)
-
 7. relay enforces membership: sender must have joined `envelope.room`
-
 8. relay dedupes by `envelope.id` (in-memory)
-
 9. relay broadcasts `chat(envelope)` to the room
-
 10. relay sends `chat_ack({id, ok, reason?})` to the sender
 
 Notes:
@@ -275,49 +269,118 @@ Notes:
 - v0 does not persist messages on the server
 - dedupe is best-effort and resets on relay restart
 
-Web client (`apps/web`)
+## Web client (`apps/web`)
 
 - connects to relay via Socket.IO (auth token)
-- attempts to join the active room and waits for JoinAck
+- attempts to join the active room and waits for `JoinAck`
 - disables Send until the room is joined
-- tracks delivery state via chat_ack:
-- pending → sent (ack ok)
-- pending → failed (ack reject) or retry limit reached
+- tracks delivery state via `chat_ack`:
+
+  - pending → sent (ack ok)
+  - pending → failed (ack reject) or retry limit reached
+
 - retries pending messages after reconnect (bounded)
 - surfaces room join denial reasons + allowed rooms list
 
 ---
 
+# Roadmap: BFT-inspired COP direction
+
+This repo is intentionally small, but the direction is explicit.
+
+## Core concept: Mission Packages (“fills”)
+
+A **Mission Package** is a versioned bundle intended to keep a team in uniformity:
+
+- map references (online/offline)
+- overlay layers (GeoJSON/KML)
+- route plans (polylines + checkpoints)
+- comms plan (rooms/channels + role access)
+- effective window + version + provenance
+- acknowledgments (“loaded”) + audit trail
+
+Think: _distribute once, verify everyone loaded the same picture, then operate._
+
+## Transport model: decouple app from transport
+
+- **App layer (stable):** identity, RBAC, mission packages, COP, reporting/tasking.
+- **Transport layer (replaceable):** internet relay now; local/degraded options later.
+
+This keeps the UX and data model stable while transports evolve.
+
+---
+
 ## Next milestones (core-first)
 
-**Milestone 1** — `Access control hardening`
+### Milestone 1 — Access control hardening
 
-- multiple tokens + rotation/revocation (already supported via INVITE_TOKENS)
+- multiple tokens + rotation/revocation (already supported via `INVITE_TOKENS`)
 - room-scoped tokens (token grants access to a subset of rooms)
 - basic audit logging: unauthorized connect attempts + denied joins
-- DoD: you can invalidate one leaked link without breaking everyone else
 
-**Milestone 2** — `Reliability semantics`
+### Milestone 2 — Reliability semantics
 
 - client: pending queue survives refresh (IndexedDB) + retries with backoff
 - relay: dedupe evicts by age, not only by max size
-- optional: server adds serverReceivedAt/seq per room for stable ordering
-- DoD: kill relay, restart, clients reconnect, pending messages resend or fail deterministically
+- optional: server adds `serverReceivedAt/seq` per room for stable ordering
 
-**Milestone 3** — `Persistence (optional)`
+### Milestone 3 — COP (Map + Overlays) MVP
 
-- start client-only (IndexedDB) so it’s free and simple
-- later: relay persistence (SQLite) if you need multi-device history
-- DoD: reload page, history is still there
+- Leaflet COP view
+- layer manager (markers/lines/polygons)
+- import/export overlays (GeoJSON)
+- incident-scoped, opt-in location sharing with precision controls
 
-**Milestone 4** — `Security posture for “shareable link”`
+### Milestone 4 — Mission Packages (“fills”) v1
+
+- create/version/export/import mission packages
+- required acknowledgments (“loaded by X”) + provenance
+- role-based distribution (who can publish vs consume)
+
+### Milestone 5 — Incident workspace
+
+- report templates (SITREP/hazard/task)
+- assignments + acknowledgments + completion states
+- leader/dispatcher view (governance + accountability)
+
+### Milestone 6 — Security posture for shareable links
 
 - HTTPS (required for many browser APIs later)
 - rate limiting + abuse protection
 - tighten CORS to real domains once deployed
-- DoD: you can deploy and share a link without “open relay” risk
+- retention controls + export policy
 
-**Milestone 5** — `Alternative transports (later)`
+### Milestone 7 — Offline / degraded
 
-- WebRTC datachannel fallback
-- local-first / store-and-forward strategies
+- offline tiles (optional)
+- store-and-forward sync
+- conflict rules for overlay edits
+
+### Milestone 8 — Alternative transports (later)
+
+- WebRTC data channel fallback
+- local-first sync patterns
+- BLE / Wi‑Fi Direct experiments via a transport adapter interface
+
+---
+
+## Non-goals
+
+- This is **not** a system proxy, MITM, or traffic interception tool.
+- This is **not** a “surveillance platform.” Visibility is role-based and policy-driven.
+- This is **not** a guaranteed substitute for professionally managed emergency systems.
+
+---
+
+## Safety, privacy, and legality
+
+- Use this only where you have authorization and a legitimate purpose.
+- Default posture should minimize sensitive data (especially location).
+- Treat device compromise as normal: plan for offboarding/revocation.
+
+---
+
+## Status
+
+- v0: chat rooms + invite tokens + allowlisted rooms + acks/dedupe/retry
+- direction: BFT-inspired COP with mission packages, overlays, and incident workflows
